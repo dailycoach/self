@@ -21,48 +21,92 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Request Pages rebuild from latest default branch
-        id: request
+      - name: Request and verify Pages rebuild
+        id: pages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set +e
-          response_code=$(curl --silent --show-error --location \
-            --output /tmp/pages-build-response.json \
+
+          request_code=$(curl --silent --show-error --location \
+            --output /tmp/pages-build-request.json \
             --write-out "%{http_code}" \
             --request POST \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${REPOSITORY}/pages/builds")
-          response_body=$(cat /tmp/pages-build-response.json 2>/dev/null || true)
-          export RESPONSE_CODE="${response_code}"
-          export RESPONSE_BODY="${response_body}"
+
+          request_body=$(cat /tmp/pages-build-request.json 2>/dev/null || true)
+          latest_code=0
+          latest_status="not_checked"
+          latest_body=""
+
+          if [ "${request_code}" = "201" ]; then
+            for attempt in $(seq 1 36); do
+              sleep 5
+              latest_code=$(curl --silent --show-error --location \
+                --output /tmp/pages-build-latest.json \
+                --write-out "%{http_code}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${REPOSITORY}/pages/builds/latest")
+              latest_body=$(cat /tmp/pages-build-latest.json 2>/dev/null || true)
+              if [ "${latest_code}" = "200" ]; then
+                latest_status=$(python -c 'import json; print(json.load(open("/tmp/pages-build-latest.json", encoding="utf-8")).get("status", "unknown"))' 2>/dev/null || echo "unknown")
+                if [ "${latest_status}" = "built" ] || [ "${latest_status}" = "errored" ]; then
+                  break
+                fi
+              fi
+            done
+          fi
+
+          export REQUEST_CODE="${request_code}"
+          export REQUEST_BODY="${request_body}"
+          export LATEST_CODE="${latest_code}"
+          export LATEST_STATUS="${latest_status}"
+          export LATEST_BODY="${latest_body}"
+
           python - <<'PY'
           import json, os, datetime
+
+          def decode(value):
+              try:
+                  return json.loads(value)
+              except Exception:
+                  return value
+
           payload = {
               "workflow": "force-pages-build",
               "repository": os.environ["REPOSITORY"],
               "sourceSha": os.environ["SOURCE_SHA"],
-              "httpStatus": int(os.environ.get("RESPONSE_CODE", "0")),
-              "response": os.environ.get("RESPONSE_BODY", ""),
-              "requestedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()
+              "requestHttpStatus": int(os.environ.get("REQUEST_CODE", "0")),
+              "requestResponse": decode(os.environ.get("REQUEST_BODY", "")),
+              "latestBuildHttpStatus": int(os.environ.get("LATEST_CODE", "0")),
+              "latestBuildStatus": os.environ.get("LATEST_STATUS", "unknown"),
+              "latestBuild": decode(os.environ.get("LATEST_BODY", "")),
+              "checkedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()
           }
           with open("deploy-status.json", "w", encoding="utf-8") as f:
               json.dump(payload, f, ensure_ascii=False, indent=2)
               f.write("\n")
           PY
-          echo "response_code=${response_code}" >> "$GITHUB_OUTPUT"
 
-      - name: Save deployment response
+          echo "request_code=${request_code}" >> "$GITHUB_OUTPUT"
+          echo "latest_status=${latest_status}" >> "$GITHUB_OUTPUT"
+
+      - name: Save deployment status
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy-status.json
-          git commit -m "chore: record Pages deploy response [skip ci]" || exit 0
+          git commit -m "chore: record completed Pages build [skip ci]" || exit 0
           git push
 
-      - name: Verify request accepted
-        run: test "${{ steps.request.outputs.response_code }}" = "201"
+      - name: Verify deployment completed
+        run: |
+          test "${{ steps.pages.outputs.request_code }}" = "201"
+          test "${{ steps.pages.outputs.latest_status }}" = "built"
