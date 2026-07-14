@@ -21,12 +21,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Request and verify Pages rebuild
+      - name: Request, verify and read live Pages site
         id: pages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ github.sha }}
+          LIVE_URL: https://dailycoach.github.io/self/index.html
         run: |
           set +e
 
@@ -64,11 +65,45 @@ jobs:
             done
           fi
 
+          live_http=0
+          live_status="not_checked"
+          live_title=""
+          live_sha256=""
+
+          if [ "${latest_status}" = "built" ]; then
+            for attempt in $(seq 1 36); do
+              live_http=$(curl --silent --show-error --location \
+                --output /tmp/live-site.html \
+                --write-out "%{http_code}" \
+                --header "Cache-Control: no-cache, no-store, max-age=0" \
+                --header "Pragma: no-cache" \
+                "${LIVE_URL}?deploy=${SOURCE_SHA}-${attempt}")
+              live_title=$(python - <<'PY'
+          import re
+          text = open('/tmp/live-site.html', encoding='utf-8', errors='replace').read()
+          match = re.search(r'<title>(.*?)</title>', text, re.I | re.S)
+          print(re.sub(r'\s+', ' ', match.group(1)).strip() if match else '')
+          PY
+              )
+              live_sha256=$(sha256sum /tmp/live-site.html 2>/dev/null | awk '{print $1}')
+              if grep -Fq '<title>SELF INC. | 자존감 운영 점검</title>' /tmp/live-site.html; then
+                live_status="verified"
+                break
+              fi
+              live_status="stale"
+              sleep 5
+            done
+          fi
+
           export REQUEST_CODE="${request_code}"
           export REQUEST_BODY="${request_body}"
           export LATEST_CODE="${latest_code}"
           export LATEST_STATUS="${latest_status}"
           export LATEST_BODY="${latest_body}"
+          export LIVE_HTTP="${live_http}"
+          export LIVE_STATUS="${live_status}"
+          export LIVE_TITLE="${live_title}"
+          export LIVE_SHA256="${live_sha256}"
 
           python - <<'PY'
           import json, os, datetime
@@ -88,6 +123,13 @@ jobs:
               "latestBuildHttpStatus": int(os.environ.get("LATEST_CODE", "0")),
               "latestBuildStatus": os.environ.get("LATEST_STATUS", "unknown"),
               "latestBuild": decode(os.environ.get("LATEST_BODY", "")),
+              "liveCheck": {
+                  "url": os.environ.get("LIVE_URL", ""),
+                  "httpStatus": int(os.environ.get("LIVE_HTTP", "0")),
+                  "status": os.environ.get("LIVE_STATUS", "unknown"),
+                  "title": os.environ.get("LIVE_TITLE", ""),
+                  "sha256": os.environ.get("LIVE_SHA256", "")
+              },
               "checkedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()
           }
           with open("deploy-status.json", "w", encoding="utf-8") as f:
@@ -97,16 +139,18 @@ jobs:
 
           echo "request_code=${request_code}" >> "$GITHUB_OUTPUT"
           echo "latest_status=${latest_status}" >> "$GITHUB_OUTPUT"
+          echo "live_status=${live_status}" >> "$GITHUB_OUTPUT"
 
       - name: Save deployment status
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy-status.json
-          git commit -m "chore: record completed Pages build [skip ci]" || exit 0
+          git commit -m "chore: record live Pages verification [skip ci]" || exit 0
           git push
 
-      - name: Verify deployment completed
+      - name: Verify deployment completed and is live
         run: |
           test "${{ steps.pages.outputs.request_code }}" = "201"
           test "${{ steps.pages.outputs.latest_status }}" = "built"
+          test "${{ steps.pages.outputs.live_status }}" = "verified"
